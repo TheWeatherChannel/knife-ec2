@@ -17,13 +17,16 @@
 #
 
 require File.expand_path('../../spec_helper', __FILE__)
+require 'net/ssh/proxy/http'
+require 'net/ssh/proxy/command'
+require 'net/ssh/gateway'
 require 'fog'
 require 'chef/knife/bootstrap'
 require 'chef/knife/bootstrap_windows_winrm'
 require 'chef/knife/bootstrap_windows_ssh'
 
 describe Chef::Knife::Ec2ServerCreate do
-  before do
+  before(:each) do
     @knife_ec2_create = Chef::Knife::Ec2ServerCreate.new
     @knife_ec2_create.initial_sleep_delay = 0
     @knife_ec2_create.stub(:tcp_test_ssh).and_return(true)
@@ -87,9 +90,65 @@ describe Chef::Knife::Ec2ServerCreate do
       @bootstrap.should_receive(:run)
     end
 
+    it "defaults to a distro of 'chef-full' for a linux instance" do
+      @new_ec2_server.should_receive(:wait_for).and_return(true)
+      @knife_ec2_create.config[:distro] = @knife_ec2_create.options[:distro][:default]
+      @knife_ec2_create.run
+      @bootstrap.config[:distro].should == 'chef-full'
+    end
+
     it "creates an EC2 instance and bootstraps it" do
       @new_ec2_server.should_receive(:wait_for).and_return(true)
+      @knife_ec2_create.should_receive(:ssh_override_winrm)
       @knife_ec2_create.run
+      @knife_ec2_create.server.should_not == nil
+    end
+
+    it "set ssh_user value by using -x option for ssh bootstrap protocol or linux image" do
+      # Currently -x option set config[:winrm_user]
+      # default value of config[:ssh_user] is root
+      @knife_ec2_create.config[:winrm_user] = "ubuntu"
+      @knife_ec2_create.config[:ssh_user] = "root"
+
+      @new_ec2_server.should_receive(:wait_for).and_return(true)
+      @knife_ec2_create.run
+      @knife_ec2_create.config[:ssh_user].should == "ubuntu"
+      @knife_ec2_create.server.should_not == nil
+    end
+
+    it "set ssh_password value by using -P option for ssh bootstrap protocol or linux image" do
+      # Currently -P option set config[:winrm_password]
+      # default value of config[:ssh_password] is nil
+      @knife_ec2_create.config[:winrm_password] = "winrm_password"
+      @knife_ec2_create.config[:ssh_password] = nil
+
+      @new_ec2_server.should_receive(:wait_for).and_return(true)
+      @knife_ec2_create.run
+      @knife_ec2_create.config[:ssh_password].should == "winrm_password"
+      @knife_ec2_create.server.should_not == nil
+    end
+
+    it "set ssh_port value by using -p option for ssh bootstrap protocol or linux image" do
+      # Currently -p option set config[:winrm_port]
+      # default value of config[:ssh_port] is 22
+      @knife_ec2_create.config[:winrm_port] = "1234"
+      @knife_ec2_create.config[:ssh_port] = "22"
+
+      @new_ec2_server.should_receive(:wait_for).and_return(true)
+      @knife_ec2_create.run
+      @knife_ec2_create.config[:ssh_port].should == "1234"
+      @knife_ec2_create.server.should_not == nil
+    end
+
+    it "set identity_file value by using -i option for ssh bootstrap protocol or linux image" do
+      # Currently -i option set config[:kerberos_keytab_file]
+      # default value of config[:identity_file] is nil
+      @knife_ec2_create.config[:kerberos_keytab_file] = "kerberos_keytab_file"
+      @knife_ec2_create.config[:identity_file] = nil
+
+      @new_ec2_server.should_receive(:wait_for).and_return(true)
+      @knife_ec2_create.run
+      @knife_ec2_create.config[:identity_file].should == "kerberos_keytab_file"
       @knife_ec2_create.server.should_not == nil
     end
 
@@ -142,8 +201,20 @@ describe Chef::Knife::Ec2ServerCreate do
       @bootstrap_winrm = Chef::Knife::BootstrapWindowsWinrm.new
       Chef::Knife::BootstrapWindowsWinrm.stub(:new).and_return(@bootstrap_winrm)
       @bootstrap_winrm.should_receive(:run)
+      @knife_ec2_create.should_not_receive(:ssh_override_winrm)
       @new_ec2_server.should_receive(:wait_for).and_return(true)
       @knife_ec2_create.run
+    end
+
+    it "set default distro to windows-chef-client-msi for windows" do
+      @knife_ec2_create.config[:winrm_password] = 'winrm-password'
+      @knife_ec2_create.config[:bootstrap_protocol] = 'winrm'      
+      @bootstrap_winrm = Chef::Knife::BootstrapWindowsWinrm.new
+      Chef::Knife::BootstrapWindowsWinrm.stub(:new).and_return(@bootstrap_winrm)
+      @bootstrap_winrm.should_receive(:run)
+      @new_ec2_server.should_receive(:wait_for).and_return(true)
+      @knife_ec2_create.run
+      @knife_ec2_create.config[:distro].should == "windows-chef-client-msi"
     end
 
     it "bootstraps via the SSH protocol" do
@@ -151,6 +222,7 @@ describe Chef::Knife::Ec2ServerCreate do
       bootstrap_win_ssh = Chef::Knife::BootstrapWindowsSsh.new
       Chef::Knife::BootstrapWindowsSsh.stub(:new).and_return(bootstrap_win_ssh)
       bootstrap_win_ssh.should_receive(:run)
+      @knife_ec2_create.should_receive(:ssh_override_winrm)
       @new_ec2_server.should_receive(:wait_for).and_return(true)
       @knife_ec2_create.run
     end
@@ -425,6 +497,33 @@ describe Chef::Knife::Ec2ServerCreate do
       @knife_ec2_create.ui.stub(:error)
     end
 
+    describe "when reading aws_credential_file" do 
+      before do
+        Chef::Config[:knife].delete(:aws_access_key_id)
+        Chef::Config[:knife].delete(:aws_secret_access_key)
+
+        Chef::Config[:knife][:aws_credential_file] = '/apple/pear'
+        @access_key_id = 'access_key_id'
+        @secret_key = 'secret_key'
+      end
+
+      it "reads UNIX Line endings" do
+        File.stub(:read).
+          and_return("AWSAccessKeyId=#{@access_key_id}\nAWSSecretKey=#{@secret_key}")
+        @knife_ec2_create.validate!
+        Chef::Config[:knife][:aws_access_key_id].should == @access_key_id
+        Chef::Config[:knife][:aws_secret_access_key].should == @secret_key
+      end
+
+      it "reads DOS Line endings" do
+        File.stub(:read).
+          and_return("AWSAccessKeyId=#{@access_key_id}\r\nAWSSecretKey=#{@secret_key}")
+        @knife_ec2_create.validate!
+        Chef::Config[:knife][:aws_access_key_id].should == @access_key_id
+        Chef::Config[:knife][:aws_secret_access_key].should == @secret_key
+      end
+    end
+
     it "disallows security group names when using a VPC" do
       @knife_ec2_create.config[:subnet_id] = 'subnet-1a2b3c4d'
       @knife_ec2_create.config[:security_group_ids] = 'sg-aabbccdd'
@@ -444,6 +543,21 @@ describe Chef::Knife::Ec2ServerCreate do
       File.stub(:read).and_return("AWSAccessKeyId=b\nAWSSecretKey=a")
 
       lambda { @knife_ec2_create.validate! }.should raise_error SystemExit
+    end
+
+    it "disallows associate public ip option when not using a VPC" do
+      @knife_ec2_create.config[:associate_public_ip] = true
+      @knife_ec2_create.config[:subnet_id] = nil
+
+      lambda { @knife_ec2_create.validate! }.should raise_error SystemExit
+    end
+  end
+
+  describe "when creating the connection" do
+    it "uses aws_session_token value from the --aws-session-token option" do
+      @knife_ec2_create.config[:aws_session_token] = 'session-token'
+      Fog::Compute::AWS.should_receive(:new).with(hash_including(:aws_session_token => 'session-token')).and_return(@ec2_connection)
+      @knife_ec2_create.connection
     end
   end
 
@@ -516,6 +630,41 @@ describe Chef::Knife::Ec2ServerCreate do
       server_def[:private_ip_address].should == '10.0.0.10'
     end
 
+    it "sets the IAM server role when one is specified" do
+      @knife_ec2_create.config[:iam_instance_profile] = ['iam-role']
+      server_def = @knife_ec2_create.create_server_def
+
+      server_def[:iam_instance_profile_name].should == ['iam-role']
+    end
+
+    it "doesn't set an IAM server role by default" do
+      server_def = @knife_ec2_create.create_server_def
+
+      server_def[:iam_instance_profile_name].should == nil
+    end
+    
+    it 'Set Tenancy Dedicated when both VPC mode and Flag is True' do
+      @knife_ec2_create.config[:dedicated_instance] = true
+      @knife_ec2_create.stub(:vpc_mode? => true)
+      
+      server_def = @knife_ec2_create.create_server_def
+      server_def[:tenancy].should == "dedicated"
+    end
+    
+    it 'Tenancy should be default with no vpc mode even is specified' do
+      @knife_ec2_create.config[:dedicated_instance] = true
+      
+      server_def = @knife_ec2_create.create_server_def
+      server_def[:tenancy].should == nil
+    end
+    
+    it 'Tenancy should be default with vpc but not requested' do
+      @knife_ec2_create.stub(:vpc_mode? => true)
+      
+      server_def = @knife_ec2_create.create_server_def
+      server_def[:tenancy].should == nil
+    end
+    
     it "sets associate_public_ip to true if specified and in vpc_mode" do
       @knife_ec2_create.config[:subnet_id] = 'subnet-1a2b3c4d'
       @knife_ec2_create.config[:associate_public_ip] = true
@@ -523,6 +672,57 @@ describe Chef::Knife::Ec2ServerCreate do
 
       server_def[:subnet_id].should == 'subnet-1a2b3c4d'
       server_def[:associate_public_ip].should == true
+    end
+  end
+
+  describe "wait_for_sshd" do
+    let(:gateway) { 'test.gateway.com' }
+    let(:hostname) { 'test.host.com' }
+
+    it "should wait for tunnelled ssh if a ssh gateway is provided" do
+      @knife_ec2_create.stub(:get_ssh_gateway_for).and_return(gateway)
+      @knife_ec2_create.should_receive(:wait_for_tunnelled_sshd).with(gateway, hostname)
+      @knife_ec2_create.wait_for_sshd(hostname)
+    end
+
+    it "should wait for direct ssh if a ssh gateway is not provided" do
+      @knife_ec2_create.stub(:get_ssh_gateway_for).and_return(nil)
+      @knife_ec2_create.config[:ssh_port] = 22
+      @knife_ec2_create.should_receive(:wait_for_direct_sshd).with(hostname, 22)
+      @knife_ec2_create.wait_for_sshd(hostname)
+    end
+  end
+
+  describe "get_ssh_gateway_for" do
+    let(:gateway) { 'test.gateway.com' }
+    let(:hostname) { 'test.host.com' }
+
+    it "should give precedence to the ssh gateway specified in the knife configuration" do
+      Net::SSH::Config.stub(:for).and_return(:proxy => Net::SSH::Proxy::Command.new("ssh some.other.gateway.com nc %h %p"))
+      @knife_ec2_create.config[:ssh_gateway] = gateway
+      @knife_ec2_create.get_ssh_gateway_for(hostname).should == gateway
+    end
+
+    it "should return the ssh gateway specified in the ssh configuration even if the config option is not set" do
+      # This should already be false, but test this explicitly for regression
+      @knife_ec2_create.config[:ssh_gateway] = false
+      Net::SSH::Config.stub(:for).and_return(:proxy => Net::SSH::Proxy::Command.new("ssh #{gateway} nc %h %p"))
+      @knife_ec2_create.get_ssh_gateway_for(hostname).should == gateway
+    end
+
+    it "should return nil if the ssh gateway cannot be parsed from the ssh proxy command" do
+      Net::SSH::Config.stub(:for).and_return(:proxy => Net::SSH::Proxy::Command.new("cannot parse host"))
+      @knife_ec2_create.get_ssh_gateway_for(hostname).should be_nil
+    end
+
+    it "should return nil if the ssh proxy is not a proxy command" do
+      Net::SSH::Config.stub(:for).and_return(:proxy => Net::SSH::Proxy::HTTP.new("httphost.com"))
+      @knife_ec2_create.get_ssh_gateway_for(hostname).should be_nil
+    end
+
+    it "returns nil if the ssh config has no proxy" do
+      Net::SSH::Config.stub(:for).and_return(:user => "darius")
+      @knife_ec2_create.get_ssh_gateway_for(hostname).should be_nil
     end
   end
 
@@ -547,7 +747,6 @@ describe Chef::Knife::Ec2ServerCreate do
         @knife_ec2_create.stub(:vpc_mode? => true)
         @knife_ec2_create.ssh_connect_host.should == 'private_ip'
       end
-
     end
 
     describe "with custom server attribute" do
@@ -555,6 +754,98 @@ describe Chef::Knife::Ec2ServerCreate do
         @knife_ec2_create.config[:server_connect_attribute] = 'custom'
         @knife_ec2_create.ssh_connect_host.should == 'custom'
       end
+    end
+  end
+
+  describe "tunnel_test_ssh" do
+    let(:gateway_host) { 'test.gateway.com' }
+    let(:gateway) { double('gateway') }
+    let(:hostname) { 'test.host.com' }
+    let(:local_port) { 23 }
+
+    before(:each) do
+      @knife_ec2_create.stub(:configure_ssh_gateway).and_return(gateway)
+    end
+
+    it "should test ssh through a gateway" do
+      @knife_ec2_create.config[:ssh_port] = 22
+      gateway.should_receive(:open).with(hostname, 22).and_yield(local_port)
+      @knife_ec2_create.should_receive(:tcp_test_ssh).with('localhost', local_port).and_return(true)
+      @knife_ec2_create.tunnel_test_ssh(gateway_host, hostname).should be_true
+    end
+  end
+
+  describe "configure_ssh_gateway" do
+    let(:gateway_host) { 'test.gateway.com' }
+    let(:gateway_user) { 'gateway_user' }
+
+    it "configures a ssh gateway with no user and the default port when the SSH Config is empty" do
+      Net::SSH::Config.stub(:for).and_return({})
+      Net::SSH::Gateway.should_receive(:new).with(gateway_host, nil, :port => 22)
+      @knife_ec2_create.configure_ssh_gateway(gateway_host)
+    end
+
+    it "configures a ssh gateway with the user specified in the SSH Config" do
+      Net::SSH::Config.stub(:for).and_return({ :user => gateway_user })
+      Net::SSH::Gateway.should_receive(:new).with(gateway_host, gateway_user, :port => 22)
+      @knife_ec2_create.configure_ssh_gateway(gateway_host)
+    end
+
+    it "configures a ssh gateway with the user specified in the ssh gateway string" do
+      Net::SSH::Config.stub(:for).and_return({ :user => gateway_user })
+      Net::SSH::Gateway.should_receive(:new).with(gateway_host, 'override_user', :port => 22)
+      @knife_ec2_create.configure_ssh_gateway("override_user@#{gateway_host}")
+    end
+
+    it "configures a ssh gateway with the port specified in the ssh gateway string" do
+      Net::SSH::Config.stub(:for).and_return({})
+      Net::SSH::Gateway.should_receive(:new).with(gateway_host, nil, :port => '24')
+      @knife_ec2_create.configure_ssh_gateway("#{gateway_host}:24")
+    end
+
+    it "configures a ssh gateway with the keys specified in the SSH Config" do
+      Net::SSH::Config.stub(:for).and_return({ :keys => ['configuredkey'] })
+      Net::SSH::Gateway.should_receive(:new).with(gateway_host, nil, :port => 22, :keys => ['configuredkey'])
+      @knife_ec2_create.configure_ssh_gateway(gateway_host)
+    end
+
+    it "configures the ssh gateway with the key specified on the knife config / command line" do
+      @knife_ec2_create.config[:ssh_gateway_identity] = "/home/fireman/.ssh/gateway.pem"
+      #Net::SSH::Config.stub(:for).and_return({ :keys => ['configuredkey'] })
+      Net::SSH::Gateway.should_receive(:new).with(gateway_host, nil, :port => 22, :keys => ['/home/fireman/.ssh/gateway.pem'])
+      @knife_ec2_create.configure_ssh_gateway(gateway_host)
+    end
+
+    it "prefers the knife config over the ssh config for the gateway keys" do
+      @knife_ec2_create.config[:ssh_gateway_identity] = "/home/fireman/.ssh/gateway.pem"
+      Net::SSH::Config.stub(:for).and_return({ :keys => ['not_this_key_dude'] })
+      Net::SSH::Gateway.should_receive(:new).with(gateway_host, nil, :port => 22, :keys => ['/home/fireman/.ssh/gateway.pem'])
+      @knife_ec2_create.configure_ssh_gateway(gateway_host)
+    end
+  end
+
+  describe "tcp_test_ssh" do
+    # Normally we would only get the header after we send a client header, e.g. 'SSH-2.0-client'
+    it "should return true if we get an ssh header" do
+      @knife_ec2_create = Chef::Knife::Ec2ServerCreate.new
+      TCPSocket.stub(:new).and_return(StringIO.new("SSH-2.0-OpenSSH_6.1p1 Debian-4"))
+      IO.stub(:select).and_return(true)
+      @knife_ec2_create.should_receive(:tcp_test_ssh).and_yield.and_return(true)
+      @knife_ec2_create.tcp_test_ssh("blackhole.ninja", 22) {nil}
+    end
+
+    it "should return false if we do not get an ssh header" do
+      @knife_ec2_create = Chef::Knife::Ec2ServerCreate.new
+      TCPSocket.stub(:new).and_return(StringIO.new(""))
+      IO.stub(:select).and_return(true)
+      @knife_ec2_create.tcp_test_ssh("blackhole.ninja", 22).should be_false
+    end
+
+    it "should return false if the socket isn't ready" do
+      @knife_ec2_create = Chef::Knife::Ec2ServerCreate.new
+      TCPSocket.stub(:new)
+      IO.stub(:select).and_return(false)
+      @knife_ec2_create.tcp_test_ssh("blackhole.ninja", 22).should be_false
     end
   end
 end
